@@ -1,0 +1,20 @@
+[tool.poetry]
+name = "codex-test"
+version = "0.1.0"
+description = ""
+authors = ["rongzhimai"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = ">=3.10,<4.0"
+loguru = "^0.7.3"
+dotenv = "^0.9.9"
+openai = "^2.16.0"
+pypdf2 = "^3.0.1"
+pdfplumber = "^0.11.9"
+ipykernel = "^7.2.0"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
