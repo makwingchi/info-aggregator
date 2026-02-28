@@ -53,7 +53,11 @@ DATA_PROPS_RE = re.compile(
 
 
 def fetch_url(url: str, timeout: int = 30) -> str:
-    # Fetch remote HTML/JSON with a consistent user agent.
+    """Fetch text content from a URL.
+
+    A single helper is used for all remote reads so headers/timeouts are
+    consistent across AlphaXiv, Hugging Face, and arXiv API requests.
+    """
     logger.debug(f"Fetching URL: {url} (timeout={timeout})")
     req = Request(
         url,
@@ -72,7 +76,12 @@ def fetch_url_with_retry(
     attempts: int = 3,
     backoff_seconds: float = 1.0,
 ) -> str:
-    # Fetch a URL with exponential-backoff retries.
+    """Fetch URL text with bounded retries and exponential backoff.
+
+    This is used for page fetches where transient network failures are common.
+    The function raises a RuntimeError after the final attempt so callers can
+    decide whether to hard-fail or degrade gracefully.
+    """
     if attempts <= 0:
         raise ValueError("attempts must be >= 1")
     last_exc: Optional[Exception] = None
@@ -93,13 +102,17 @@ def fetch_url_with_retry(
 
 
 def strip_tags(text: str) -> str:
-    # Remove HTML tags and normalize whitespace.
+    """Remove HTML tags/entities and collapse extra whitespace."""
     cleaned = re.sub(r"<[^>]+>", " ", text)
     return " ".join(unescape(cleaned).split())
 
 
 def normalize_arxiv_id(text: Any) -> Optional[str]:
-    # Extract and normalize an arXiv ID from a blob of text.
+    """Extract canonical arXiv id from arbitrary text.
+
+    Supports both modern IDs (e.g. 2401.12345) and legacy category IDs
+    (e.g. cs/0501001). Version suffixes like 'v2' are dropped.
+    """
     if not text:
         return None
     match = ARXIV_ID_RE.search(str(text))
@@ -113,7 +126,11 @@ def normalize_arxiv_id(text: Any) -> Optional[str]:
 
 
 def extract_likes(text: str) -> Optional[int]:
-    # Find a likes count inside a text snippet.
+    """Extract a like/upvote integer from loosely structured text.
+
+    Different HTML sources format likes differently, so multiple regex patterns
+    are attempted in order from most explicit to most generic.
+    """
     if not text:
         return None
     patterns = [
@@ -134,7 +151,7 @@ def extract_likes(text: str) -> Optional[int]:
 
 
 def extract_json_from_next_data(html: str) -> Optional[Dict[str, Any]]:
-    # Parse __NEXT_DATA__ JSON payload if present.
+    """Parse Next.js `__NEXT_DATA__` JSON payload when present."""
     match = NEXT_DATA_RE.search(html)
     if not match:
         return None
@@ -146,7 +163,7 @@ def extract_json_from_next_data(html: str) -> Optional[Dict[str, Any]]:
 
 
 def extract_json_from_data_props(html: str) -> Optional[Dict[str, Any]]:
-    # Parse data-props JSON payload used by Hugging Face DailyPapers.
+    """Parse `data-props` JSON used by Hugging Face DailyPapers cards."""
     match = DATA_PROPS_RE.search(html)
     if not match:
         return None
@@ -159,7 +176,7 @@ def extract_json_from_data_props(html: str) -> Optional[Dict[str, Any]]:
 
 
 def walk_json(obj: Any) -> Iterable[Dict[str, Any]]:
-    # Yield dict nodes from nested JSON.
+    """Depth-first traversal yielding every dict node in nested JSON."""
     if isinstance(obj, dict):
         yield obj
         for value in obj.values():
@@ -170,11 +187,15 @@ def walk_json(obj: Any) -> Iterable[Dict[str, Any]]:
 
 
 def collect_papers_from_json(data: Dict[str, Any], source: str) -> List[Dict[str, Any]]:
-    # Heuristically extract paper-like dicts from JSON payloads.
+    """Heuristically extract paper records from nested JSON structures.
+
+    The source payload schemas are not stable, so this function checks several
+    alternative keys and falls back to regex extraction when needed.
+    """
     results: List[Dict[str, Any]] = []
     seen: set[str] = set()
     for node in walk_json(data):
-        # For Hugging Face, prefer the nested 'paper' object if it exists
+        # Hugging Face often nests paper fields under `paper`.
         paper_obj = node.get("paper")
         paper_node = paper_obj if isinstance(paper_obj, dict) else node
 
@@ -201,7 +222,7 @@ def collect_papers_from_json(data: Dict[str, Any], source: str) -> List[Dict[str
                     likes = None
                 break
 
-        # Use arXiv URL as default if not present
+        # Preserve source URL when available; otherwise link directly to arXiv.
         url = paper_node.get("url") or node.get("url")
         if not url and arxiv_id:
             url = f"https://arxiv.org/abs/{arxiv_id}"
@@ -220,7 +241,7 @@ def collect_papers_from_json(data: Dict[str, Any], source: str) -> List[Dict[str
 
 
 def parse_alphaxiv_html(html: str) -> List[Dict[str, Any]]:
-    # Extract papers from AlphaXiv HTML when JSON is unavailable.
+    """Parse AlphaXiv HTML directly when JSON payload parsing is unavailable."""
     results: List[Dict[str, Any]] = []
     seen: set[str] = set()
     title_pattern = re.compile(
@@ -257,7 +278,7 @@ def parse_alphaxiv_html(html: str) -> List[Dict[str, Any]]:
         seen.add(arxiv_id)
     if results:
         return results
-    # Fallback: attempt a generic arXiv ID scan if the card parsing fails.
+    # Fallback parser for markup drift: scan for any arXiv IDs in raw HTML.
     for match in ARXIV_ID_RE.finditer(html):
         arxiv_id = normalize_arxiv_id(match.group(0))
         if not arxiv_id or arxiv_id in seen:
@@ -293,7 +314,7 @@ def parse_alphaxiv_html(html: str) -> List[Dict[str, Any]]:
 
 
 def parse_hf_html(html: str) -> List[Dict[str, Any]]:
-    # Extract papers from Hugging Face HTML when JSON is unavailable.
+    """Parse Hugging Face Daily Papers HTML when JSON extraction fails."""
     results: List[Dict[str, Any]] = []
     seen: set[str] = set()
     for match in HF_PAPER_RE.finditer(html):
@@ -306,7 +327,7 @@ def parse_hf_html(html: str) -> List[Dict[str, Any]]:
         title_match = re.search(r"<h[23][^>]*>(.*?)</h[23]>", context, re.S | re.I)
         title = strip_tags(title_match.group(1)) if title_match else None
 
-        # Look for likes in <div class="leading-none">NUMBER</div> pattern
+        # Primary likes pattern currently used in Hugging Face paper cards.
         likes_match = re.search(
             r'<div\s+class="leading-none">(\d+)</div>',
             context,
@@ -334,7 +355,7 @@ def parse_hf_html(html: str) -> List[Dict[str, Any]]:
 
 
 def parse_alphaxiv(html: str) -> List[Dict[str, Any]]:
-    # Parse AlphaXiv using JSON payloads with an HTML fallback.
+    """Parse AlphaXiv using JSON first, then HTML fallback for resilience."""
     data = extract_json_from_next_data(html)
     if data:
         papers = collect_papers_from_json(data, "alphaxiv")
@@ -344,7 +365,7 @@ def parse_alphaxiv(html: str) -> List[Dict[str, Any]]:
 
 
 def parse_huggingface(html: str) -> List[Dict[str, Any]]:
-    # Parse Hugging Face using JSON payloads with an HTML fallback.
+    """Parse Hugging Face using JSON first, then HTML fallback for resilience."""
     data = extract_json_from_next_data(html)
     if data:
         papers = collect_papers_from_json(data, "huggingface")
@@ -359,7 +380,13 @@ def parse_huggingface(html: str) -> List[Dict[str, Any]]:
 
 
 def load_previous_ids(path: str) -> set[str]:
-    # Load previously scraped arXiv IDs for deduping.
+    """Load prior arXiv IDs from saved JSON payloads.
+
+    Accepts either:
+    - {"items": [...]} payloads (current format), or
+    - legacy top-level list payloads.
+    Malformed entries are skipped rather than failing the whole run.
+    """
     if not os.path.exists(path):
         return set()
     try:
@@ -391,7 +418,11 @@ def load_previous_ids(path: str) -> set[str]:
 
 
 def save_payload(path: str, payload: Dict[str, Any]) -> None:
-    # Persist scraped metadata to JSON.
+    """Persist run data as pretty-printed JSON.
+
+    Parent directories are created only when a parent path is present, which
+    avoids errors for filenames that intentionally target the current directory.
+    """
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
@@ -402,7 +433,7 @@ def save_payload(path: str, payload: Dict[str, Any]) -> None:
 def filter_alphaxiv_by_likes(
     papers: Sequence[Dict[str, Any]], min_likes: int
 ) -> List[Dict[str, Any]]:
-    # Keep AlphaXiv papers that meet the likes threshold.
+    """Filter AlphaXiv papers by inclusive likes threshold (>=)."""
     filtered = []
     for paper in papers:
         likes = paper.get("likes")
@@ -421,7 +452,7 @@ def filter_alphaxiv_by_likes(
 def filter_huggingface_by_likes(
     papers: Sequence[Dict[str, Any]], min_likes: int
 ) -> List[Dict[str, Any]]:
-    # Keep Hugging Face papers whose likes exceed the threshold.
+    """Filter Hugging Face papers by strict likes threshold (>)."""
     filtered = []
     for paper in papers:
         likes = paper.get("likes")
@@ -440,7 +471,7 @@ def filter_huggingface_by_likes(
 def dedupe_by_ids(
     papers: Sequence[Dict[str, Any]], seen_ids: set[str]
 ) -> List[Dict[str, Any]]:
-    # Drop papers whose arXiv IDs appear in the seen set.
+    """Drop records missing an id or already present in `seen_ids`."""
     result = []
     for paper in papers:
         arxiv_id = paper.get("arxiv_id")
@@ -451,7 +482,13 @@ def dedupe_by_ids(
 
 
 def merge_sources(papers: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    # Merge papers across sources using arXiv ID as the key.
+    """Merge paper records by arXiv id across multiple sources.
+
+    Merge rules:
+    - Preserve all contributing source names in `sources`
+    - Prefer non-empty title/url when one source is missing data
+    - Keep max like count across sources
+    """
     merged: Dict[str, Dict[str, Any]] = {}
     for paper in papers:
         arxiv_id = paper.get("arxiv_id")
@@ -474,13 +511,17 @@ def merge_sources(papers: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def chunked(items: Sequence[str], size: int) -> Iterable[List[str]]:
-    # Yield chunks of a list.
+    """Yield fixed-size chunks from a sequence."""
     for idx in range(0, len(items), size):
         yield list(items[idx : idx + size])
 
 
 def fetch_arxiv_metadata(arxiv_ids: Sequence[str]) -> Dict[str, Dict[str, Any]]:
-    # Fetch title/abstract/authors from the arXiv API.
+    """Fetch title/abstract/author metadata from the arXiv Atom API.
+
+    Requests are batched to keep URLs short and avoid oversize id_list queries.
+    Partial failures are tolerated: bad batches are skipped with warnings.
+    """
     results: Dict[str, Dict[str, Any]] = {}
     if not arxiv_ids:
         return results
@@ -519,12 +560,15 @@ def fetch_arxiv_metadata(arxiv_ids: Sequence[str]) -> Dict[str, Dict[str, Any]]:
 
 
 def safe_arxiv_filename(arxiv_id: str) -> str:
-    # Build a filesystem-friendly PDF name.
+    """Convert arXiv id into a filesystem-safe PDF filename."""
     return arxiv_id.replace("/", "_") + ".pdf"
 
 
 def download_pdf(arxiv_id: str, output_dir: str) -> Optional[str]:
-    # Download an arXiv PDF if not already present.
+    """Download one arXiv PDF unless it already exists locally.
+
+    Returns the local file path on success, otherwise None.
+    """
     if not arxiv_id:
         return None
     os.makedirs(output_dir, exist_ok=True)
@@ -549,7 +593,13 @@ def download_pdf(arxiv_id: str, output_dir: str) -> Optional[str]:
 
 
 def build_llm_client() -> Tuple[str, Any, str]:
-    # Build either Azure OpenAI or OpenAI client config.
+    """Build and return configured LLM client tuple.
+
+    Return shape:
+    - ("azure", AzureOpenAIClient, deployment_name)
+    - ("openai", OpenAIClient, model_name)
+    Raises RuntimeError when configuration/dependencies are missing.
+    """
     missing_azure = [key for key in ENV_KEYS_AZURE if not os.getenv(key)]
     if not missing_azure:
         try:
@@ -581,7 +631,11 @@ def build_llm_client() -> Tuple[str, Any, str]:
 
 
 def extract_text_from_pdf(pdf_path: str, max_pages: int = 200) -> Optional[str]:
-    """Extract text from PDF file using PyPDF2."""
+    """Extract text from a PDF using PyPDF2.
+
+    The result is intentionally bounded to keep downstream prompt size within
+    manageable limits for LLM summarization calls.
+    """
     try:
         import PyPDF2
     except ImportError:
@@ -615,7 +669,10 @@ def extract_text_from_pdf(pdf_path: str, max_pages: int = 200) -> Optional[str]:
 def summarize_paper_llm(
     client_info: Tuple[str, Any, str], paper: Dict[str, Any]
 ) -> str:
-    # Summarize a paper using LLM with full PDF text if available.
+    """Generate one paper summary using configured LLM provider.
+
+    The prompt includes metadata and, when available, extracted PDF text.
+    """
     provider, client, model = client_info
     arxiv_id = paper.get("arxiv_id")
     pdf_path = paper.get("pdf_path")
@@ -627,7 +684,7 @@ def summarize_paper_llm(
         "Think in English, and respond in Simplified Chinese."
     )
 
-    # Build user message with metadata
+    # Metadata is always included so summaries still work without full text.
     metadata = {
         "title": paper.get("title"),
         "authors": paper.get("authors"),
@@ -639,7 +696,7 @@ def summarize_paper_llm(
 
     user_content = f"Please analyze this paper:\n\n{json.dumps(metadata, ensure_ascii=True, indent=2)}"
 
-    # Extract and include PDF text if available
+    # PDF text is optional; the run should not fail if extraction fails.
     pdf_text = None
     if pdf_path and os.path.exists(pdf_path):
         logger.debug(f"Extracting text from PDF: {pdf_path}")
@@ -672,7 +729,7 @@ def summarize_paper_llm(
 
 
 def extract_response_content(response: Any) -> str:
-    # Extract non-empty string content from an LLM response.
+    """Validate and return non-empty text from chat completion response."""
     choices = getattr(response, "choices", None)
     if not choices:
         raise RuntimeError("empty or malformed LLM response: missing choices")
@@ -696,7 +753,14 @@ def render_report(
     papers: List[Dict[str, Any]],
     source_errors: Dict[str, str],
 ) -> str:
-    # Build a markdown report for the run.
+    """Render full markdown report for this run.
+
+    Includes:
+    - top-level summary
+    - per-source stats
+    - degraded-mode source warnings
+    - per-paper details with abstract and generated summary
+    """
     lines = [f"# Papers Report ({report_date.isoformat()})", ""]
 
     lines.append("## Summary")
@@ -708,6 +772,7 @@ def render_report(
     lines.append("")
 
     if source_errors:
+        # Surface partial-failure context so readers trust the final output.
         lines.append("## Source Warnings")
         lines.append("The report was generated in degraded mode due to source failures:")
         lines.append("")
@@ -775,7 +840,8 @@ def render_report(
             if pdf_path:
                 lines.append(f"- **PDF**: `{pdf_path}`")
 
-            # Add abstract
+            # Abstract and summary are rendered as plain paragraphs to keep
+            # the report readable when content is long.
             abstract = paper.get("abstract")
             if abstract:
                 lines.append("")
@@ -793,7 +859,7 @@ def render_report(
 
 
 def parse_date_yyyy_mm_dd(value: str) -> date:
-    # Parse YYYY-MM-DD input for argparse.
+    """argparse validator for strict YYYY-MM-DD dates."""
     try:
         return datetime.strptime(value, "%Y-%m-%d").date()
     except ValueError as exc:
@@ -803,7 +869,7 @@ def parse_date_yyyy_mm_dd(value: str) -> date:
 
 
 def parse_timezone(value: str) -> str:
-    # Validate timezone input for argparse.
+    """argparse validator for IANA timezone names."""
     tz_name = value.strip()
     if not tz_name:
         raise argparse.ArgumentTypeError("Timezone cannot be empty.")
@@ -816,7 +882,7 @@ def parse_timezone(value: str) -> str:
 
 
 def parse_nonempty_dir(value: str) -> str:
-    # Reject empty directory arguments in argparse.
+    """argparse validator to prevent empty output/input directory values."""
     path = value.strip()
     if not path:
         raise argparse.ArgumentTypeError("Directory path cannot be empty.")
@@ -824,7 +890,7 @@ def parse_nonempty_dir(value: str) -> str:
 
 
 def resolve_date(date_value: Optional[date], tz_name: str) -> date:
-    # Resolve a date argument or default to today in the requested timezone.
+    """Resolve explicit date or derive current date in requested timezone."""
     if date_value:
         return date_value
     if ZoneInfo is not None:
@@ -835,6 +901,13 @@ def resolve_date(date_value: Optional[date], tz_name: str) -> date:
 
 
 def main() -> int:
+    """Run the full paper aggregation pipeline.
+
+    Exit codes:
+    - 0: normal success (including partial-source degraded mode)
+    - 1: both sources failed, or report write failed
+    - 2: argparse validation errors (handled by argparse)
+    """
     parser = argparse.ArgumentParser(
         description="Scrape papers from AlphaXiv and Hugging Face, deduplicate, and summarize with LLM."
     )
@@ -884,8 +957,13 @@ def main() -> int:
     parser.add_argument("--max-papers", type=int, default=50, help="Limit number of papers.")
     args = parser.parse_args()
 
+    # Environment variables from --env-file only populate missing values
+    # so existing shell environment takes precedence.
     load_dotenv(args.env_file, override=False)
 
+    # Date model:
+    # - AlphaXiv uses "today"
+    # - Hugging Face daily page is for "yesterday"
     today = resolve_date(args.date, args.tz)
     alpha_date = today
     hf_date = today - timedelta(days=1)
@@ -894,7 +972,8 @@ def main() -> int:
     logger.info(f"Starting paper scraping for {today.isoformat()}")
     logger.info(f"AlphaXiv date: {alpha_date.isoformat()}, HuggingFace date: {hf_date.isoformat()}")
 
-    # Step 1: Scrape AlphaXiv
+    # Track per-source health to support degraded-mode operation.
+    # `source_ok` controls final exit code policy.
     logger.info("Step 1/6: Scraping AlphaXiv...")
     source_errors: Dict[str, str] = {}
     source_ok = {"alphaxiv": False, "huggingface": False}
@@ -905,6 +984,8 @@ def main() -> int:
     hf_filtered: List[Dict[str, Any]] = []
     hf_new: List[Dict[str, Any]] = []
     try:
+        # Source stage is isolated in try/except so one source outage
+        # doesn't prevent report generation from the other source.
         alpha_html = fetch_url_with_retry(ALPHAXIV_URL, source_name="AlphaXiv")
         alpha_raw = parse_alphaxiv(alpha_html)
         logger.info(f"  Found {len(alpha_raw)} papers from AlphaXiv")
@@ -912,7 +993,7 @@ def main() -> int:
         alpha_filtered = filter_alphaxiv_by_likes(alpha_raw, args.likes_threshold)
         logger.info(f"  Filtered to {len(alpha_filtered)} papers with likes >= {args.likes_threshold}")
 
-        # Step 2: Deduplicate AlphaXiv against yesterday
+        # Step 2 dedupe for AlphaXiv is day-over-day deduplication.
         logger.info("Step 2/6: Deduplicating AlphaXiv against yesterday's data...")
         alpha_prev_path = os.path.join(args.data_dir, f"alphaxiv_{alpha_prev_date:%Y%m%d}.json")
         alpha_seen = load_previous_ids(alpha_prev_path)
@@ -933,7 +1014,7 @@ def main() -> int:
         logger.error(f"  AlphaXiv processing failed: {exc}")
         logger.info("  Continuing without AlphaXiv data")
 
-    # Step 3: Scrape Hugging Face
+    # Step 3 starts an independent source pipeline for Hugging Face.
     logger.info("Step 3/6: Scraping Hugging Face daily papers...")
     hf_url = HF_URL_TEMPLATE.format(date=hf_date.isoformat())
     logger.info(f"  URL: {hf_url}")
@@ -945,7 +1026,8 @@ def main() -> int:
         hf_filtered = filter_huggingface_by_likes(hf_raw, args.hf_likes_threshold)
         logger.info(f"  Filtered to {len(hf_filtered)} papers with likes > {args.hf_likes_threshold}")
 
-        # Step 4: Deduplicate HF against AlphaXiv (cross-source dedup)
+        # Step 4 dedupe for Hugging Face is cross-source deduplication
+        # against today's AlphaXiv set (not yesterday).
         logger.info("Step 4/6: Deduplicating Hugging Face against AlphaXiv...")
         alpha_ids = {paper.get("arxiv_id") for paper in alpha_filtered if paper.get("arxiv_id")}
         hf_new = dedupe_by_ids(hf_filtered, alpha_ids)
@@ -965,7 +1047,7 @@ def main() -> int:
         logger.error(f"  Hugging Face processing failed: {exc}")
         logger.info("  Continuing without Hugging Face data")
 
-    # Step 5: Merge and process
+    # Step 5 combines source outputs and enriches each paper with metadata.
     logger.info("Step 5/6: Merging sources and downloading PDFs...")
     combined = merge_sources(alpha_new + hf_new)
     logger.info(f"  Total papers after merge: {len(combined)}")
@@ -991,6 +1073,7 @@ def main() -> int:
         paper["abstract"] = meta.get("abstract")
         paper["authors"] = meta.get("authors")
 
+    # A merged paper is considered a duplicate when it has >1 contributing source.
     duplicates = [paper for paper in combined if len(paper.get("sources", [])) > 1]
     logger.info(f"  Identified {len(duplicates)} cross-source duplicates")
 
@@ -1007,7 +1090,7 @@ def main() -> int:
             downloaded_count += 1
     logger.info(f"  Downloaded {downloaded_count}/{len(combined)} PDFs")
 
-    # Step 6: Generate LLM summaries
+    # Step 6 runs optional summarization. Failures are isolated per paper.
     logger.info("Step 6/6: Generating LLM summaries...")
     client_info = None
     if not args.no_llm and combined:
@@ -1033,6 +1116,8 @@ def main() -> int:
                 paper["summary"] = summarize_paper_llm(client_info, paper)
                 summarized_count += 1
             except Exception as first_exc:
+                # One bounded retry handles transient provider/network issues
+                # while keeping runtime predictable.
                 logger.warning(
                     f"  First LLM attempt failed for {paper.get('arxiv_id')}: {first_exc}. Retrying once..."
                 )
@@ -1046,7 +1131,7 @@ def main() -> int:
     if not args.no_llm:
         logger.info(f"  Successfully summarized {summarized_count}/{len(combined)} papers")
 
-    # Generate report
+    # Report generation is deterministic from in-memory pipeline state.
     logger.info("Generating markdown report...")
     report = render_report(
         report_date=today,
@@ -1083,6 +1168,8 @@ def main() -> int:
     logger.info(f"✓ Cross-source duplicates: {len(duplicates)}")
     if source_errors:
         logger.warning(f"Source failures encountered: {source_errors}")
+    # If neither source produced data successfully, treat run as failed even if
+    # a degraded report file was written.
     if not any(source_ok.values()):
         logger.error("Both sources failed. Report generated with no source data.")
         return 1
