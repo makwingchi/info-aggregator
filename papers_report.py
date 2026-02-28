@@ -65,6 +65,33 @@ def fetch_url(url: str, timeout: int = 30) -> str:
         return resp.read().decode("utf-8", errors="replace")
 
 
+def fetch_url_with_retry(
+    url: str,
+    source_name: str,
+    timeout: int = 30,
+    attempts: int = 3,
+    backoff_seconds: float = 1.0,
+) -> str:
+    # Fetch a URL with exponential-backoff retries.
+    if attempts <= 0:
+        raise ValueError("attempts must be >= 1")
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return fetch_url(url, timeout=timeout)
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= attempts:
+                break
+            sleep_seconds = backoff_seconds * (2 ** (attempt - 1))
+            logger.warning(
+                f"{source_name} fetch attempt {attempt}/{attempts} failed: {exc}. "
+                f"Retrying in {sleep_seconds:.1f}s..."
+            )
+            time.sleep(sleep_seconds)
+    raise RuntimeError(f"{source_name} fetch failed after {attempts} attempts: {last_exc}") from last_exc
+
+
 def strip_tags(text: str) -> str:
     # Remove HTML tags and normalize whitespace.
     cleaned = re.sub(r"<[^>]+>", " ", text)
@@ -341,9 +368,22 @@ def load_previous_ids(path: str) -> set[str]:
     except (OSError, json.JSONDecodeError) as exc:
         logger.warning(f"Failed to load {path}: {exc}")
         return set()
-    items = payload.get("items", payload if isinstance(payload, list) else [])
+    if isinstance(payload, dict):
+        items_value = payload.get("items", [])
+        if isinstance(items_value, list):
+            items = items_value
+        else:
+            logger.warning(f"Invalid items payload in {path}: expected list, got {type(items_value).__name__}")
+            items = []
+    elif isinstance(payload, list):
+        items = payload
+    else:
+        logger.warning(f"Invalid payload shape in {path}: expected dict/list, got {type(payload).__name__}")
+        items = []
     result = set()
     for item in items:
+        if not isinstance(item, dict):
+            continue
         arxiv_id = item.get("arxiv_id")
         if arxiv_id:
             result.add(arxiv_id)
@@ -352,7 +392,9 @@ def load_previous_ids(path: str) -> set[str]:
 
 def save_payload(path: str, payload: Dict[str, Any]) -> None:
     # Persist scraped metadata to JSON.
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=True, indent=2)
 
@@ -626,7 +668,22 @@ def summarize_paper_llm(
             messages=messages,
             temperature=0.2,
         )
-    return response.choices[0].message.content.strip()
+    return extract_response_content(response)
+
+
+def extract_response_content(response: Any) -> str:
+    # Extract non-empty string content from an LLM response.
+    choices = getattr(response, "choices", None)
+    if not choices:
+        raise RuntimeError("empty or malformed LLM response: missing choices")
+    first_choice = choices[0]
+    message = getattr(first_choice, "message", None)
+    if message is None:
+        raise RuntimeError("empty or malformed LLM response: missing message")
+    content = getattr(message, "content", None)
+    if not isinstance(content, str) or not content.strip():
+        raise RuntimeError("empty or malformed LLM response: missing content")
+    return content.strip()
 
 
 def render_report(
@@ -637,6 +694,7 @@ def render_report(
     hf_stats: Dict[str, int],
     duplicates: List[Dict[str, Any]],
     papers: List[Dict[str, Any]],
+    source_errors: Dict[str, str],
 ) -> str:
     # Build a markdown report for the run.
     lines = [f"# Papers Report ({report_date.isoformat()})", ""]
@@ -648,6 +706,17 @@ def render_report(
     )
     lines.append(f"- **Cross-source duplicates**: {len(duplicates)}")
     lines.append("")
+
+    if source_errors:
+        lines.append("## Source Warnings")
+        lines.append("The report was generated in degraded mode due to source failures:")
+        lines.append("")
+        source_labels = {"alphaxiv": "AlphaXiv", "huggingface": "Hugging Face"}
+        for source_key, error_text in source_errors.items():
+            source_label = source_labels.get(source_key, source_key)
+            retries_exhausted = "Yes" if "after 3 attempts" in error_text else "Unknown"
+            lines.append(f"- **{source_label}**: retries exhausted = {retries_exhausted}; error = {error_text}")
+        lines.append("")
 
     lines.append("## Source Statistics")
     lines.append(
@@ -723,10 +792,41 @@ def render_report(
     return "\n".join(lines).rstrip() + "\n"
 
 
-def resolve_date(date_str: Optional[str], tz_name: str) -> date:
-    # Resolve a date string or default to today in the requested timezone.
-    if date_str:
-        return datetime.strptime(date_str, "%Y-%m-%d").date()
+def parse_date_yyyy_mm_dd(value: str) -> date:
+    # Parse YYYY-MM-DD input for argparse.
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"Invalid date '{value}'. Expected format YYYY-MM-DD."
+        ) from exc
+
+
+def parse_timezone(value: str) -> str:
+    # Validate timezone input for argparse.
+    tz_name = value.strip()
+    if not tz_name:
+        raise argparse.ArgumentTypeError("Timezone cannot be empty.")
+    if ZoneInfo is not None:
+        try:
+            ZoneInfo(tz_name)
+        except Exception as exc:
+            raise argparse.ArgumentTypeError(f"Invalid timezone '{tz_name}'.") from exc
+    return tz_name
+
+
+def parse_nonempty_dir(value: str) -> str:
+    # Reject empty directory arguments in argparse.
+    path = value.strip()
+    if not path:
+        raise argparse.ArgumentTypeError("Directory path cannot be empty.")
+    return path
+
+
+def resolve_date(date_value: Optional[date], tz_name: str) -> date:
+    # Resolve a date argument or default to today in the requested timezone.
+    if date_value:
+        return date_value
     if ZoneInfo is not None:
         now = datetime.now(ZoneInfo(tz_name))
     else:
@@ -740,9 +840,15 @@ def main() -> int:
     )
     parser.add_argument(
         "--date",
+        type=parse_date_yyyy_mm_dd,
         help="Date to treat as today (YYYY-MM-DD). AlphaXiv uses this date, HF uses yesterday.",
     )
-    parser.add_argument("--tz", default=DEFAULT_TZ, help="Timezone for date resolution.")
+    parser.add_argument(
+        "--tz",
+        type=parse_timezone,
+        default=DEFAULT_TZ,
+        help="Timezone for date resolution.",
+    )
     parser.add_argument(
         "--likes-threshold",
         type=int,
@@ -755,9 +861,24 @@ def main() -> int:
         default=DEFAULT_HF_LIKES_THRESHOLD,
         help="Minimum Hugging Face likes to include (>).",
     )
-    parser.add_argument("--data-dir", default="data", help="Directory for scraped JSON.")
-    parser.add_argument("--pdf-dir", default="papers", help="Directory for PDFs.")
-    parser.add_argument("--report-dir", default="reports", help="Directory for markdown reports.")
+    parser.add_argument(
+        "--data-dir",
+        type=parse_nonempty_dir,
+        default="data",
+        help="Directory for scraped JSON.",
+    )
+    parser.add_argument(
+        "--pdf-dir",
+        type=parse_nonempty_dir,
+        default="papers",
+        help="Directory for PDFs.",
+    )
+    parser.add_argument(
+        "--report-dir",
+        type=parse_nonempty_dir,
+        default="reports",
+        help="Directory for markdown reports.",
+    )
     parser.add_argument("--env-file", default=".env", help="Path to dotenv file.")
     parser.add_argument("--no-llm", action="store_true", help="Skip LLM summaries.")
     parser.add_argument("--max-papers", type=int, default=50, help="Limit number of papers.")
@@ -775,54 +896,74 @@ def main() -> int:
 
     # Step 1: Scrape AlphaXiv
     logger.info("Step 1/6: Scraping AlphaXiv...")
-    alpha_html = fetch_url(ALPHAXIV_URL)
-    alpha_raw = parse_alphaxiv(alpha_html)
-    logger.info(f"  Found {len(alpha_raw)} papers from AlphaXiv")
+    source_errors: Dict[str, str] = {}
+    source_ok = {"alphaxiv": False, "huggingface": False}
+    alpha_raw: List[Dict[str, Any]] = []
+    alpha_filtered: List[Dict[str, Any]] = []
+    alpha_new: List[Dict[str, Any]] = []
+    hf_raw: List[Dict[str, Any]] = []
+    hf_filtered: List[Dict[str, Any]] = []
+    hf_new: List[Dict[str, Any]] = []
+    try:
+        alpha_html = fetch_url_with_retry(ALPHAXIV_URL, source_name="AlphaXiv")
+        alpha_raw = parse_alphaxiv(alpha_html)
+        logger.info(f"  Found {len(alpha_raw)} papers from AlphaXiv")
 
-    alpha_filtered = filter_alphaxiv_by_likes(alpha_raw, args.likes_threshold)
-    logger.info(f"  Filtered to {len(alpha_filtered)} papers with likes >= {args.likes_threshold}")
+        alpha_filtered = filter_alphaxiv_by_likes(alpha_raw, args.likes_threshold)
+        logger.info(f"  Filtered to {len(alpha_filtered)} papers with likes >= {args.likes_threshold}")
 
-    # Step 2: Deduplicate AlphaXiv against yesterday
-    logger.info("Step 2/6: Deduplicating AlphaXiv against yesterday's data...")
-    alpha_prev_path = os.path.join(args.data_dir, f"alphaxiv_{alpha_prev_date:%Y%m%d}.json")
-    alpha_seen = load_previous_ids(alpha_prev_path)
-    alpha_new = dedupe_by_ids(alpha_filtered, alpha_seen)
-    logger.info(f"  Found {len(alpha_new)} new papers (not in yesterday's {len(alpha_seen)} papers)")
+        # Step 2: Deduplicate AlphaXiv against yesterday
+        logger.info("Step 2/6: Deduplicating AlphaXiv against yesterday's data...")
+        alpha_prev_path = os.path.join(args.data_dir, f"alphaxiv_{alpha_prev_date:%Y%m%d}.json")
+        alpha_seen = load_previous_ids(alpha_prev_path)
+        alpha_new = dedupe_by_ids(alpha_filtered, alpha_seen)
+        logger.info(f"  Found {len(alpha_new)} new papers (not in yesterday's {len(alpha_seen)} papers)")
 
-    alpha_payload = {
-        "date": alpha_date.isoformat(),
-        "source": "alphaxiv",
-        "items": alpha_filtered,
-    }
-    alpha_path = os.path.join(args.data_dir, f"alphaxiv_{alpha_date:%Y%m%d}.json")
-    save_payload(alpha_path, alpha_payload)
-    logger.info(f"  Saved AlphaXiv data to {alpha_path}")
+        alpha_payload = {
+            "date": alpha_date.isoformat(),
+            "source": "alphaxiv",
+            "items": alpha_filtered,
+        }
+        alpha_path = os.path.join(args.data_dir, f"alphaxiv_{alpha_date:%Y%m%d}.json")
+        save_payload(alpha_path, alpha_payload)
+        logger.info(f"  Saved AlphaXiv data to {alpha_path}")
+        source_ok["alphaxiv"] = True
+    except Exception as exc:
+        source_errors["alphaxiv"] = str(exc)
+        logger.error(f"  AlphaXiv processing failed: {exc}")
+        logger.info("  Continuing without AlphaXiv data")
 
     # Step 3: Scrape Hugging Face
     logger.info("Step 3/6: Scraping Hugging Face daily papers...")
     hf_url = HF_URL_TEMPLATE.format(date=hf_date.isoformat())
     logger.info(f"  URL: {hf_url}")
-    hf_html = fetch_url(hf_url)
-    hf_raw = parse_huggingface(hf_html)
-    logger.info(f"  Found {len(hf_raw)} papers from Hugging Face")
+    try:
+        hf_html = fetch_url_with_retry(hf_url, source_name="Hugging Face")
+        hf_raw = parse_huggingface(hf_html)
+        logger.info(f"  Found {len(hf_raw)} papers from Hugging Face")
 
-    hf_filtered = filter_huggingface_by_likes(hf_raw, args.hf_likes_threshold)
-    logger.info(f"  Filtered to {len(hf_filtered)} papers with likes > {args.hf_likes_threshold}")
+        hf_filtered = filter_huggingface_by_likes(hf_raw, args.hf_likes_threshold)
+        logger.info(f"  Filtered to {len(hf_filtered)} papers with likes > {args.hf_likes_threshold}")
 
-    # Step 4: Deduplicate HF against AlphaXiv (cross-source dedup)
-    logger.info("Step 4/6: Deduplicating Hugging Face against AlphaXiv...")
-    alpha_ids = {paper.get("arxiv_id") for paper in alpha_filtered if paper.get("arxiv_id")}
-    hf_new = dedupe_by_ids(hf_filtered, alpha_ids)
-    logger.info(f"  Found {len(hf_new)} papers unique to Hugging Face")
+        # Step 4: Deduplicate HF against AlphaXiv (cross-source dedup)
+        logger.info("Step 4/6: Deduplicating Hugging Face against AlphaXiv...")
+        alpha_ids = {paper.get("arxiv_id") for paper in alpha_filtered if paper.get("arxiv_id")}
+        hf_new = dedupe_by_ids(hf_filtered, alpha_ids)
+        logger.info(f"  Found {len(hf_new)} papers unique to Hugging Face")
 
-    hf_payload = {
-        "date": hf_date.isoformat(),
-        "source": "huggingface",
-        "items": hf_filtered,
-    }
-    hf_path = os.path.join(args.data_dir, f"huggingface_{hf_date:%Y%m%d}.json")
-    save_payload(hf_path, hf_payload)
-    logger.info(f"  Saved Hugging Face data to {hf_path}")
+        hf_payload = {
+            "date": hf_date.isoformat(),
+            "source": "huggingface",
+            "items": hf_filtered,
+        }
+        hf_path = os.path.join(args.data_dir, f"huggingface_{hf_date:%Y%m%d}.json")
+        save_payload(hf_path, hf_payload)
+        logger.info(f"  Saved Hugging Face data to {hf_path}")
+        source_ok["huggingface"] = True
+    except Exception as exc:
+        source_errors["huggingface"] = str(exc)
+        logger.error(f"  Hugging Face processing failed: {exc}")
+        logger.info("  Continuing without Hugging Face data")
 
     # Step 5: Merge and process
     logger.info("Step 5/6: Merging sources and downloading PDFs...")
@@ -888,8 +1029,16 @@ def main() -> int:
             continue
         try:
             logger.info(f"  Summarizing paper {idx}/{len(combined)}: {paper.get('arxiv_id')}")
-            paper["summary"] = summarize_paper_llm(client_info, paper)
-            summarized_count += 1
+            try:
+                paper["summary"] = summarize_paper_llm(client_info, paper)
+                summarized_count += 1
+            except Exception as first_exc:
+                logger.warning(
+                    f"  First LLM attempt failed for {paper.get('arxiv_id')}: {first_exc}. Retrying once..."
+                )
+                time.sleep(1.0)
+                paper["summary"] = summarize_paper_llm(client_info, paper)
+                summarized_count += 1
         except Exception as exc:
             logger.warning(f"  LLM summarization failed for {paper.get('arxiv_id')}: {exc}")
             paper["summary"] = "(LLM summarization failed.)"
@@ -917,16 +1066,26 @@ def main() -> int:
         },
         duplicates=duplicates,
         papers=combined,
+        source_errors=source_errors,
     )
 
-    os.makedirs(args.report_dir, exist_ok=True)
-    report_path = os.path.join(args.report_dir, f"papers_{today:%Y%m%d}.md")
-    with open(report_path, "w", encoding="utf-8") as handle:
-        handle.write(report)
+    try:
+        os.makedirs(args.report_dir, exist_ok=True)
+        report_path = os.path.join(args.report_dir, f"papers_{today:%Y%m%d}.md")
+        with open(report_path, "w", encoding="utf-8") as handle:
+            handle.write(report)
+    except OSError as exc:
+        logger.error(f"Failed to write report: {exc}")
+        return 1
 
     logger.info(f"✓ Report saved to {report_path}")
     logger.info(f"✓ Total papers: {len(combined)} ({len(alpha_new)} AlphaXiv + {len(hf_new)} HuggingFace)")
     logger.info(f"✓ Cross-source duplicates: {len(duplicates)}")
+    if source_errors:
+        logger.warning(f"Source failures encountered: {source_errors}")
+    if not any(source_ok.values()):
+        logger.error("Both sources failed. Report generated with no source data.")
+        return 1
     logger.info("Done!")
     return 0
 

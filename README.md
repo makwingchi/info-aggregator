@@ -107,6 +107,13 @@ poetry run python papers_report.py
 --max-papers N             # Limit number of papers (default: 50)
 ```
 
+**Reliability behavior:**
+- Invalid `--date`, `--tz`, or empty directory args fail fast with argparse errors (exit code `2`)
+- AlphaXiv/Hugging Face source fetches retry automatically (up to 3 attempts with backoff)
+- If one source fails, report generation continues with remaining source data and includes a source warning section
+- If both sources fail, the script still writes a degraded report but exits with code `1`
+- Report write failures also exit with code `1`
+
 **Example:**
 ```bash
 poetry run python papers_report.py --likes-threshold 100 --max-papers 20
