@@ -13,6 +13,7 @@ openai = "^2.16.0"
 pypdf2 = "^3.0.1"
 pdfplumber = "^0.11.9"
 ipykernel = "^7.2.0"
+markitdown = "0.1.4"
 
 
 [build-system]

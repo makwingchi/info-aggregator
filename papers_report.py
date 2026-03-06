@@ -631,36 +631,28 @@ def build_llm_client() -> Tuple[str, Any, str]:
 
 
 def extract_text_from_pdf(pdf_path: str, max_pages: int = 200) -> Optional[str]:
-    """Extract text from a PDF using PyPDF2.
+    """Extract text from a PDF as Markdown using markitdown.
 
-    The result is intentionally bounded to keep downstream prompt size within
-    manageable limits for LLM summarization calls.
+    Markdown is a more LLM-friendly format than raw extracted text, preserving
+    headings, emphasis, and structural cues that improve summarization quality.
+    The result is bounded to keep downstream prompt size within manageable limits.
     """
     try:
-        import PyPDF2
+        from markitdown import MarkItDown
     except ImportError:
-        logger.warning("PyPDF2 not installed. Install with: pip install PyPDF2")
+        logger.warning("markitdown not installed. Install with: pip install markitdown")
         return None
 
     try:
-        with open(pdf_path, "rb") as pdf_file:
-            pdf_reader = PyPDF2.PdfReader(pdf_file)
-            num_pages = min(len(pdf_reader.pages), max_pages)
+        md = MarkItDown()
+        result = md.convert(pdf_path)
+        full_text = result.text_content
 
-            text_parts = []
-            for page_num in range(num_pages):
-                page = pdf_reader.pages[page_num]
-                text = page.extract_text()
-                if text:
-                    text_parts.append(f"--- Page {page_num + 1} ---\n{text}")
+        # Limit text length to avoid token limits (roughly 100k characters = ~25k tokens)
+        if len(full_text) > 1_000_000:
+            full_text = full_text[:1000000] + "\n\n[Text truncated due to length...]"
 
-            full_text = "\n\n".join(text_parts)
-
-            # Limit text length to avoid token limits (roughly 100k characters = ~25k tokens)
-            if len(full_text) > 1_000_000:
-                full_text = full_text[:1000000] + "\n\n[Text truncated due to length...]"
-
-            return full_text
+        return full_text
     except Exception as exc:
         logger.warning(f"Failed to extract text from PDF {pdf_path}: {exc}")
         return None
@@ -1103,12 +1095,15 @@ def main() -> int:
 
     summarized_count = 0
     for idx, paper in enumerate(combined, 1):
+        print(paper)
         if args.no_llm or not client_info:
             paper["summary"] = "(LLM summarization skipped)"
+            logger.info(f"Skip paper of index {idx}")
             continue
         abstract = paper.get("abstract")
         if not abstract:
             paper["summary"] = "(Missing abstract; skipping LLM summarization.)"
+            logger.info(f"Skip paper of index {idx} due to missing abstract")
             continue
         try:
             logger.info(f"  Summarizing paper {idx}/{len(combined)}: {paper.get('arxiv_id')}")
