@@ -51,6 +51,7 @@ yarn-error.log
 reports/
 data/
 papers/
+markdowns/
 tmp_*.html
 
 # OS
