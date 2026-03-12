@@ -125,6 +125,34 @@ def normalize_arxiv_id(text: Any) -> Optional[str]:
     return None
 
 
+def normalize_arxiv_id_with_version(text: Any) -> Optional[str]:
+    """Extract arXiv id including version suffix if present.
+
+    Unlike normalize_arxiv_id, this preserves version suffixes like 'v2'.
+    Useful when you need to download a specific version of a paper.
+
+    Returns:
+        The arXiv id with version (e.g., "2503.02240v2") or without (e.g., "2503.02240")
+        if no version was specified in the input.
+    """
+    if not text:
+        return None
+    match = ARXIV_ID_RE.search(str(text))
+    if not match:
+        return None
+    # Modern ID format: group(1) is the ID, group(2) is the optional version
+    if match.group(1):
+        base_id = match.group(1)
+        version = match.group(2) or ""
+        return base_id + version
+    # Legacy ID format: group(3) is the ID, group(4) is the optional version
+    if match.group(3):
+        base_id = match.group(3)
+        version = match.group(4) or ""
+        return base_id + version
+    return None
+
+
 def extract_likes(text: str) -> Optional[int]:
     """Extract a like/upvote integer from loosely structured text.
 
@@ -656,6 +684,86 @@ def extract_text_from_pdf(pdf_path: str, max_pages: int = 200) -> Optional[str]:
     except Exception as exc:
         logger.warning(f"Failed to extract text from PDF {pdf_path}: {exc}")
         return None
+
+
+def extract_paper_content(
+    arxiv_id: str,
+    output_dir: str = "papers",
+    redownload: bool = False,
+    save_markdown: bool = True,
+    markdown_dir: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Extract markdown content from an arXiv paper by its ID.
+
+    This is a convenience function that combines PDF download and text extraction.
+    If the PDF already exists locally, it will be reused unless `redownload` is True.
+    Optionally saves the extracted markdown to a .md file.
+
+    Args:
+        arxiv_id: The arXiv identifier (e.g., "2401.12345" or "cs/0501001").
+        output_dir: Directory to store downloaded PDFs. Defaults to "papers".
+        redownload: If True, re-download even if PDF exists locally.
+        save_markdown: If True, save extracted markdown to a .md file. Defaults to True.
+        markdown_dir: Directory to save markdown files. Defaults to output_dir if not specified.
+
+    Returns:
+        A tuple of (content, markdown_path) where:
+        - content: The extracted markdown content as a string, or None if extraction failed.
+        - markdown_path: Path to the saved markdown file, or None if not saved.
+
+    Example:
+        >>> content, md_path = extract_paper_content("2401.12345")
+        >>> if content:
+        ...     print(f"Saved to: {md_path}")
+        ...     print(content[:500])  # Print first 500 chars
+    """
+    if not arxiv_id:
+        logger.warning("Empty arxiv_id provided")
+        return None, None
+
+    # Normalize the arxiv_id (preserve version suffix like 'v2')
+    normalized_id = normalize_arxiv_id_with_version(arxiv_id)
+    if not normalized_id:
+        logger.warning(f"Invalid arxiv_id format: {arxiv_id}")
+        return None, None
+
+    # Check if PDF exists or download it
+    pdf_path = os.path.join(output_dir, safe_arxiv_filename(normalized_id))
+    if redownload or not os.path.exists(pdf_path):
+        logger.info(f"Downloading PDF for arxiv_id: {normalized_id}")
+        pdf_path = download_pdf(normalized_id, output_dir)
+        if not pdf_path:
+            logger.error(f"Failed to download PDF for {normalized_id}")
+            return None, None
+    else:
+        logger.info(f"Using cached PDF: {pdf_path}")
+
+    # Extract text using markitdown
+    logger.info(f"Extracting markdown from: {pdf_path}")
+    content = extract_text_from_pdf(pdf_path)
+
+    if not content:
+        logger.error(f"Failed to extract content from {pdf_path}")
+        return None, None
+
+    logger.info(f"Successfully extracted {len(content)} characters from {normalized_id}")
+
+    # Save markdown to file
+    markdown_path = None
+    if save_markdown:
+        save_dir = markdown_dir if markdown_dir else output_dir
+        os.makedirs(save_dir, exist_ok=True)
+        safe_id = normalized_id.replace("/", "_")
+        markdown_path = os.path.join(save_dir, f"{safe_id}.md")
+        try:
+            with open(markdown_path, "w", encoding="utf-8") as handle:
+                handle.write(content)
+            logger.info(f"Saved markdown to: {markdown_path}")
+        except OSError as exc:
+            logger.warning(f"Failed to save markdown file: {exc}")
+            markdown_path = None
+
+    return content, markdown_path
 
 
 def summarize_paper_llm(
